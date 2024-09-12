@@ -1,10 +1,9 @@
 import { execFile } from "child_process";
 import { dirname } from "path";
 import { promisify } from "util";
+import * as vscode from "vscode";
 
 const execFileP = promisify(execFile);
-
-import * as vscode from "vscode";
 
 async function findModificationTimeByLine(path: string) {
   let blameOutput;
@@ -13,7 +12,11 @@ async function findModificationTimeByLine(path: string) {
       cwd: dirname(path),
     });
   } catch (e) {
-    console.error(`Could not run git blame: ${e.message}`);
+    if (e instanceof Error) {
+      console.error(`Could not run git blame: ${e.message}`);
+    } else {
+      console.error(`Could not run git blame: ${e}`);
+    }
     return [];
   }
 
@@ -31,50 +34,45 @@ async function findModificationTimeByLine(path: string) {
   return times;
 }
 
-interface CategoryConfig {
-  startsFromDay: number;
-  decorationRenderOptions: Partial<vscode.DecorationRenderOptions>;
-}
+const NUM_BUCKETS = 10;
 
-function readCategoryConfigs(): CategoryConfig[] {
-  return (
-    vscode.workspace
-      .getConfiguration()
-      .get("agingLines.categories") as CategoryConfig[]
-  ).sort(
-    (categoryA, categoryB) => categoryA.startsFromDay - categoryB.startsFromDay,
-  );
-}
+type Bucket = number;
 
-let categoryConfigs = readCategoryConfigs();
+const decorationTypes: Map<Bucket, vscode.TextEditorDecorationType> = new Map();
 
-const decorationTypes = new Map();
-function matchTimeSinceModificationToDecorationType(
-  timeSinceModification: number,
-) {
-  const daysSinceTimestamp = timeSinceModification / (24 * 60 * 60 * 1000);
-
-  let decorationRenderOptions;
-  for (const categoryConfig of categoryConfigs) {
-    if (daysSinceTimestamp >= categoryConfig.startsFromDay) {
-      decorationRenderOptions = categoryConfig.decorationRenderOptions;
-    }
-  }
-
-  if (!decorationTypes.has(decorationRenderOptions)) {
-    // We could simplify this and just create a new TextEditorDecorationType
-    // every time this function is called, but this singleton technique should
-    // provide us with better VSCode performance
+function initDecorationTypes() {
+  for (let bucket = 0; bucket < NUM_BUCKETS; bucket++) {
     decorationTypes.set(
-      decorationRenderOptions,
+      bucket,
       vscode.window.createTextEditorDecorationType({
-        ...decorationRenderOptions,
+        backgroundColor: `rgba(127, 0, 0, ${bucket / NUM_BUCKETS})`,
         isWholeLine: true,
       }),
     );
   }
+}
 
-  return decorationTypes.get(decorationRenderOptions);
+initDecorationTypes();
+
+const MAXED_DECORATION_TYPE = vscode.window.createTextEditorDecorationType({
+  backgroundColor: "rgba(127, 0, 0, 1)",
+  isWholeLine: true,
+});
+
+function durationToBucket(duration: number): Bucket {
+  const years = duration / (24 * 60 * 60 * 1000);
+  const halfLife =
+    vscode.workspace.getConfiguration().get<number>("agingLines.halfLife") ??
+    365;
+  const value = 1 - Math.pow(0.5, years / halfLife);
+  const bucket = Math.floor(value * NUM_BUCKETS);
+  console.log("durationToBucket", years, bucket);
+  return bucket;
+}
+
+function getDecorationType(timeSinceModification: number) {
+  const bucket = durationToBucket(timeSinceModification);
+  return decorationTypes.get(bucket) ?? MAXED_DECORATION_TYPE;
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -88,7 +86,10 @@ export function activate(context: vscode.ExtensionContext) {
       ...(modificationTimeByLine.filter((time) => time !== null) as number[]),
     );
 
-    const decorationsByDecorationType = new Map();
+    const decorationsByDecorationType: Map<
+      vscode.TextEditorDecorationType,
+      { range: vscode.Range }[]
+    > = new Map();
 
     for (const [
       lineNumber,
@@ -98,18 +99,19 @@ export function activate(context: vscode.ExtensionContext) {
         continue;
       }
 
-      const decorationType = matchTimeSinceModificationToDecorationType(
+      const decorationType = getDecorationType(
         latestModificationTime - modificationTime,
       );
-
-      if (!decorationsByDecorationType.has(decorationType)) {
-        decorationsByDecorationType.set(decorationType, []);
-      }
-
       const decoration = {
         range: new vscode.Range(lineNumber, 0, lineNumber, 0),
       };
-      decorationsByDecorationType.get(decorationType).push(decoration);
+
+      const ranges = decorationsByDecorationType.get(decorationType);
+      if (ranges) {
+        ranges.push(decoration);
+      } else {
+        decorationsByDecorationType.set(decorationType, [decoration]);
+      }
     }
 
     for (const [
@@ -128,11 +130,6 @@ export function activate(context: vscode.ExtensionContext) {
 
   let enabled = false;
 
-  vscode.commands.registerCommand("agingLines.toggle", () => {
-    enabled = !enabled;
-    updateDecorations();
-  });
-
   const updateDecorations = async () => {
     if (!activeEditor) {
       return;
@@ -145,7 +142,12 @@ export function activate(context: vscode.ExtensionContext) {
     }
   };
 
-  let timeout: NodeJS.Timer | undefined = undefined;
+  vscode.commands.registerCommand("agingLines.toggle", () => {
+    enabled = !enabled;
+    updateDecorations();
+  });
+
+  let timeout: NodeJS.Timeout | undefined = undefined;
 
   const triggerUpdateDecorations = () => {
     if (timeout) {
@@ -180,7 +182,12 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions,
   );
 
-  vscode.workspace.onDidChangeConfiguration((event) => {
-    categoryConfigs = readCategoryConfigs();
-  });
+  vscode.workspace.onDidChangeConfiguration(
+    () => {
+      initDecorationTypes();
+      triggerUpdateDecorations();
+    },
+    null,
+    context.subscriptions,
+  );
 }
